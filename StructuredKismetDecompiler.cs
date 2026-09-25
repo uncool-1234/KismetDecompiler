@@ -205,7 +205,7 @@ public class StructuredKismetDecompiler
     {
         Reset(uber);
         BuildStatements(uber);
-        var flow = ResolveFlow();
+        var flow = ResolveFlow(calls.Select(c => c.n).ToList());
         _flowTargets = flow.TargetOf;
         _flowUnresolved = flow.Unresolved;
         SplitBlocks(flow);
@@ -353,8 +353,8 @@ public class StructuredKismetDecompiler
         }
     }
 
-    private FlowStackResolver.Result ResolveFlow() =>
-        FlowStackResolver.Resolve(_stmts.Select(s => (s.Off, s.Expr)).ToList());
+    private FlowStackResolver.Result ResolveFlow(IReadOnlyList<long>? dispatchEntries = null) =>
+        FlowStackResolver.Resolve(_stmts.Select(s => (s.Off, s.Expr)).ToList(), dispatchEntries);
 
     // ================= 2. 基本块 =================
 
@@ -386,6 +386,10 @@ public class StructuredKismetDecompiler
                     break;
                 case EX_Return:
                 case EX_EndOfScript:
+                    starts.Add(i + 1);
+                    break;
+                case EX_ComputedJump:
+                    // 分发器之后是各 case 体，不属于静态顺序路径：单独切块。
                     starts.Add(i + 1);
                     break;
             }
@@ -455,6 +459,12 @@ public class StructuredKismetDecompiler
                     break;
                 case EX_Return:
                     b.Term = Term.Return;
+                    break;
+                case EX_ComputedJump:
+                    // ubergraph 分发器：运行期按 EntryPoint 跳转，静态没有 fallthrough 后继。
+                    // 落进 default 会造出一条假的顺序边，把分发器前言和 case 体串成直线，
+                    // 污染 case 入口的流栈。各 case 入口由 EmitDispatch 单独登记为可达性根。
+                    b.Term = Term.Halt;
                     break;
                 case EX_EndOfScript:
                     b.Term = Term.Halt;

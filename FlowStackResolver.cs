@@ -47,10 +47,18 @@ public static class FlowStackResolver
         public bool PopJumps;        // 结尾是 PopExecutionFlow / PopExecutionFlowIfNot（弹出式跳转）
         public bool CondPop;         // 结尾是 PopExecutionFlowIfNot
         public bool Dead;            // 结尾是 Return / EndOfScript
+        public bool Dispatch;        // 结尾是 ComputedJump（ubergraph 分发器：静态后继是各 case 入口）
     }
 
     /// <summary>解析整段语句序列的执行流栈。</summary>
-    public static Result Resolve(IReadOnlyList<(long Off, KismetExpression Expr)> stmts)
+    /// <param name="dispatchEntries">
+    /// ubergraph 分发器的各 case 入口字节偏移（即 ExecuteUbergraph 的 EntryPoint 实参）。
+    /// 这些块只能经 ComputedJump 到达，静态 CFG 里没有入边，因此必须显式播种它们的入口栈
+    /// —— 栈内容就是分发器前言 <c>PushExecutionFlow(出口)</c> 压入的地址。
+    /// 不播种会让整段 case 体退化成「栈未知」，Pop 目标全部解析失败，效果体被吞成空循环。
+    /// </param>
+    public static Result Resolve(IReadOnlyList<(long Off, KismetExpression Expr)> stmts,
+        IReadOnlyList<long>? dispatchEntries = null)
     {
         var result = new Result();
         if (stmts.Count == 0) return result;
@@ -84,8 +92,17 @@ public static class FlowStackResolver
                     // 否则解析出的目标落在块中部，栈状态会与顺序路径混在一起产生假冲突。
                     AddTarget(starts, idxOf, p.PushingAddress);
                     break;
+                case EX_ComputedJump:
+                    // 分发器之后的字节不属于任何静态路径，单独切块。
+                    starts.Add(i + 1);
+                    break;
             }
         }
+
+        // 各 case 入口必须是块边界，否则播种的栈会落在块中部而被顺序路径污染。
+        if (dispatchEntries is not null)
+            foreach (var e in dispatchEntries)
+                AddTarget(starts, idxOf, e);
 
         var arr = starts.ToArray();
         var blocks = new List<Block>();
@@ -127,6 +144,11 @@ public static class FlowStackResolver
                     b.JumpSucc = -1;
                     b.FallSucc = i + 1 < blocks.Count ? i + 1 : -1;
                     break;
+                case EX_ComputedJump:
+                    // ubergraph 分发器：静态后继是「各 case 入口」，不是顺序块。
+                    // 按顺序块处理会让各 case 入口拿到错误的前驱栈（甚至拿不到栈）。
+                    b.Dispatch = true;
+                    break;
                 default:
                     b.FallSucc = i + 1 < blocks.Count ? i + 1 : -1;
                     break;
@@ -140,6 +162,34 @@ public static class FlowStackResolver
 
         state[0] = new List<long>();
         queue.Enqueue(0);
+
+        // ComputedJump 是分发器：0 号块（前言）在分发前 Push 了各 case 的公共出口。
+        // 各 case 入口块在静态 CFG 里没有入边，必须把它们按「分发点的出栈」播种，
+        // 否则整段 case 体的栈全为「未知」，Pop 目标解析失败 → 效果体被吞成空循环。
+        if (dispatchEntries is not null && dispatchEntries.Count > 0)
+        {
+            var dispatchStack = new List<long>();
+            for (var i = 0; i < blocks.Count; i++)
+                if (blocks[i].Dispatch)
+                {
+                    // 重放分发器所在块内的 Push，得到进入任一 case 时的初始栈。
+                    dispatchStack.Clear();
+                    for (var s = blocks[i].Start; s < blocks[i].End; s++)
+                        if (stmts[s].Expr is EX_PushExecutionFlow dp)
+                            dispatchStack.Add(dp.PushingAddress);
+                    break;
+                }
+
+            foreach (var e in dispatchEntries)
+            {
+                if (!idxOf.TryGetValue(e, out var si)) continue;
+                var bid = blockOfStmt[si];
+                if (bid < 0 || bid >= blocks.Count) continue;
+                if (bid == 0) continue;
+                state[bid] = new List<long>(dispatchStack);
+                queue.Enqueue(bid);
+            }
+        }
 
         void Offer(int succ, List<long>? outStack, long fromOff)
         {
@@ -230,6 +280,7 @@ public static class FlowStackResolver
                 continue;
             }
             if (b.Dead) continue;
+            if (b.Dispatch) continue;   // 分发器：静态出边是各 case 入口，已单独播种
             if (b.JumpSucc >= 0) Offer(b.JumpSucc, fallOut, stmts[b.End - 1].Off);   // EX_Jump
             if (b.FallSucc >= 0) Offer(b.FallSucc, fallOut, stmts[b.End - 1].Off);   // 顺序 / JumpIfNot 另一分支
         }
