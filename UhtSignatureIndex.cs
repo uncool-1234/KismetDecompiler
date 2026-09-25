@@ -94,8 +94,13 @@ public class UhtSignatureIndex
 
     public static UhtSignatureIndex Load(string dumpRoot)
     {
-        var cache = dumpRoot.TrimEnd('\\', '/') + ".uhtidx.json";
-        if (TryLoadCache(cache, out var cached)) return cached;
+        // 缓存路径：KISMETD_UHT_CACHE > <dumpRoot>.uhtidx.json > 临时目录（源码目录可能不可写）
+        var primary = Environment.GetEnvironmentVariable("KISMETD_UHT_CACHE");
+        if (string.IsNullOrWhiteSpace(primary)) primary = dumpRoot.TrimEnd('\\', '/') + ".uhtidx.json";
+        var fallback = Path.Combine(Path.GetTempPath(), "kismetd-" + ShortHash(dumpRoot) + ".uhtidx.json");
+
+        if (TryLoadCache(primary, out var cached)) return cached;
+        if (TryLoadCache(fallback, out cached)) return cached;
 
         var idx = new UhtSignatureIndex();
         if (!Directory.Exists(dumpRoot)) return idx;
@@ -113,20 +118,33 @@ public class UhtSignatureIndex
             if (module.Length == 0) continue;
             idx.ParseHeader(file, module);
         }
-        idx.SaveCache(cache);
+        if (!idx.SaveCache(primary)) idx.SaveCache(fallback);
         return idx;
     }
 
-    private void SaveCache(string path)
+    private static string ShortHash(string s)
+    {
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var bytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(s.ToLowerInvariant()));
+        return Convert.ToHexString(bytes, 0, 6);
+    }
+
+    private bool SaveCache(string path)
     {
         try
         {
             var all = ByFullKey.Values.ToArray();
-            var json = System.Text.Json.JsonSerializer.Serialize(all,
-                new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            var json = System.Text.Json.JsonSerializer.Serialize(all, new System.Text.Json.JsonSerializerOptions
+            {
+                WriteIndented = true,
+                IncludeFields = true // UhtFuncSig 是公共字段，默认不序列化字段 → 之前缓存全是 {}
+            });
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             File.WriteAllText(path, json);
+            return true;
         }
-        catch { /* 缓存失败不影响使用 */ }
+        catch { return false; /* 缓存失败不影响使用 */ }
     }
 
     private static bool TryLoadCache(string path, out UhtSignatureIndex idx)

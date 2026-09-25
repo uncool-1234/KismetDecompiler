@@ -17,6 +17,9 @@ namespace UAssetKismet.Experimental;
 /// </summary>
 public static class DispatchInliner
 {
+    /// <summary>单函数内联输出的行数上限（保险丝，正常输入远达不到）。</summary>
+    private const int MaxLinesPerFunction = 50000;
+
     public static string Run(UAsset asset, FunctionExport uber,
         IReadOnlyList<(long n, string caller)> calls, IReadOnlyList<FunctionExport> funcs,
         UhtSignatureIndex? signatures = null)
@@ -48,6 +51,20 @@ public static class DispatchInliner
         var uberIdxOf = IndexOf(uberStmts);
         var callMap = calls.ToDictionary(c => c.n, c => c.caller);
 
+        // 被多处引用的收尾/共享段：只展开一次并以 label+goto 引用，
+        // 否则每个 case 都会重新展开同一段，输出指数膨胀（曾有单函数展开到数百万行）。
+        var refCount = new Dictionary<long, int>();
+        foreach (var (_, e) in uberStmts)
+        {
+            switch (e)
+            {
+                case EX_Jump j: refCount[j.CodeOffset] = refCount.GetValueOrDefault(j.CodeOffset) + 1; break;
+                case EX_JumpIfNot j: refCount[j.CodeOffset] = refCount.GetValueOrDefault(j.CodeOffset) + 1; break;
+            }
+        }
+        var shared = new HashSet<long>(refCount.Where(kv => kv.Value > 1).Select(kv => kv.Key));
+        var pendingLabels = new SortedSet<long>();
+
         var renderer = new ExprRenderer(asset, signatures);
         var exprs = fn.ScriptBytecode ?? Array.Empty<KismetExpression>();
         var lines = new List<string>();
@@ -62,13 +79,24 @@ public static class DispatchInliner
             {
                 var callerName = callMap.TryGetValue(n.Value, out var cn) ? cn : "?";
                 lines.Add($"// ===== 内联 {callerName} (case {n.Value}) =====");
-                EmitSegmentInline(renderer, uberStmts, uberIdxOf, n.Value, lines, new HashSet<long>(), 0);
+                EmitSegmentInline(renderer, uberStmts, uberIdxOf, n.Value, lines, new HashSet<long>(), 0,
+                    shared, pendingLabels);
                 continue; // 用 case 体替换原调用语句
             }
 
             var line = renderer.Render(top);
             if (string.IsNullOrEmpty(line)) continue;
             lines.Add(line + ";");
+        }
+
+        // 展开被 goto 引用、但还没落地成 label 的共享段
+        while (pendingLabels.Count > 0)
+        {
+            var off = pendingLabels.Min;
+            pendingLabels.Remove(off);
+            lines.Add($"L_{off:X4}: // 共享跳转段（多处引用，只展开一次）");
+            EmitSegmentInline(renderer, uberStmts, uberIdxOf, off, lines, new HashSet<long>(), 0,
+                shared, pendingLabels);
         }
 
         // ---- 语义清理：连续重复 return 去重 ----
@@ -101,12 +129,15 @@ public static class DispatchInliner
         return sb.ToString();
     }
 
-    /// <summary>栈式追踪：从 uber 的 EntryPoint 偏移开始展开一个 case（goto 目标段递归内联）。</summary>
+    /// <summary>栈式追踪：从 uber 的 EntryPoint 偏移开始展开一个 case（goto 目标段递归内联）。
+    /// 被多处引用的段只展开一次，改为 label+goto 引用，避免指数膨胀。</summary>
     private static void EmitSegmentInline(ExprRenderer renderer,
         List<(long off, KismetExpression expr)> uberStmts, Dictionary<long, int> idxOf,
-        long startOff, List<string> lines, HashSet<long> stack, int depth)
+        long startOff, List<string> lines, HashSet<long> stack, int depth,
+        HashSet<long> shared, SortedSet<long> pendingLabels)
     {
         if (depth > 32) return;
+        if (lines.Count > MaxLinesPerFunction) return; // 保险丝：防止异常输入撑出超大文件
         var curStack = new HashSet<long>(stack) { startOff };
         if (curStack.Count == stack.Count) return; // 已在本链 → 防环
         if (!idxOf.TryGetValue(startOff, out var si)) return;
@@ -114,6 +145,11 @@ public static class DispatchInliner
         var i = si;
         while (i < uberStmts.Count)
         {
+            if (lines.Count > MaxLinesPerFunction)
+            {
+                lines.Add("// [截断] 该函数内联输出过长，已停止展开");
+                return;
+            }
             var (off, e) = uberStmts[i];
             switch (e)
             {
@@ -125,10 +161,16 @@ public static class DispatchInliner
                     {
                         lines.Add("return;");
                     }
+                    else if (shared.Contains(j.CodeOffset))
+                    {
+                        lines.Add($"goto L_{j.CodeOffset:X4};");
+                        pendingLabels.Add(j.CodeOffset);
+                    }
                     else
                     {
                         lines.Add($"// goto L_{j.CodeOffset:X4} 收尾段:");
-                        EmitSegmentInline(renderer, uberStmts, idxOf, j.CodeOffset, lines, curStack, depth + 1);
+                        EmitSegmentInline(renderer, uberStmts, idxOf, j.CodeOffset, lines, curStack, depth + 1,
+                            shared, pendingLabels);
                     }
                     return; // 无条件跳转，本段结束
                 }
@@ -137,7 +179,16 @@ public static class DispatchInliner
                     var cond = renderer.Render(j.BooleanExpression);
                     lines.Add($"if (!{cond})");
                     lines.Add("{");
-                    EmitSegmentInline(renderer, uberStmts, idxOf, j.CodeOffset, lines, curStack, depth + 1);
+                    if (shared.Contains(j.CodeOffset))
+                    {
+                        lines.Add($"    goto L_{j.CodeOffset:X4};");
+                        pendingLabels.Add(j.CodeOffset);
+                    }
+                    else
+                    {
+                        EmitSegmentInline(renderer, uberStmts, idxOf, j.CodeOffset, lines, curStack, depth + 1,
+                            shared, pendingLabels);
+                    }
                     lines.Add("}");
                     i++;
                     continue; // 顺序继续（条件不成立时执行目标段并返回/收尾；成立时走后续）

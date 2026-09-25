@@ -7,6 +7,16 @@ obj/
 # 反编译输出（测试产物，不入库）
 Decompiled/
 
+# 测试输入（游戏资产/映射，不入库）
+.testdata/
+m.usmap
+
+# 签名缓存
+.cache/
+
 # IDE
 .idea/
 *.suo
+
+# 全量反编译产物（生成物，不入库）
+out/
