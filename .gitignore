@@ -20,3 +20,6 @@ m.usmap
 
 # 全量反编译产物（生成物，不入库）
 out/
+
+# 本地构建的 UAssetAPI
+lib/

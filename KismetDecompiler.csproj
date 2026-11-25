@@ -8,7 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="UAssetAPI" Version="1.1.0" />
+    <!-- UAssetAPI built from the 1.1.0 source zip into lib/ (see SETUP.md). Package versions match UAssetAPI.csproj. -->
+    <Reference Include="UAssetAPI"><HintPath>lib/UAssetAPI.dll</HintPath></Reference>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.1" />
   </ItemGroup>
 
 </Project>

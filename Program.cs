@@ -54,7 +54,7 @@ var disasmMode = args.Contains("--disasm");
 var flowDebug = args.Contains("--flowdebug");
 var cfgDebug = args.Contains("--cfg");
 
-if (inputArg.Length == 0 || usmapPath.Length == 0)
+if (inputArg.Length == 0)
 {
     Console.WriteLine("用法: KismetDecompiler --input <蓝图.uasset|蓝图.json|目录> --usmap <mapping.usmap> [--inline] [--opt] [--uhtdump <dir>] [--out <dir>] [--ext .cpp] [--jobs n]");
     return;
@@ -106,7 +106,7 @@ if (assets.Count == 0)
 Directory.CreateDirectory(outRoot);
 
 // ============================ 2. 共享上下文 ============================
-var usmap = new Usmap(usmapPath);
+Usmap? usmap = usmapPath.Length > 0 ? new Usmap(usmapPath) : null;   // local: --usmap optional
 
 UhtSignatureIndex? sigIndex = null;
 if (uhtDump.Length > 0)
@@ -226,7 +226,7 @@ Environment.ExitCode = failures.IsEmpty ? 0 : 2;
 UAsset LoadAsset(string path) =>
     Path.GetExtension(path).Equals(".json", StringComparison.OrdinalIgnoreCase)
         ? UAsset.DeserializeJson(File.ReadAllText(path))
-        : new UAsset(path, EngineVersion.VER_UE5_6, usmap, CustomSerializationFlags.None);
+        : new UAsset(path, Enum.Parse<EngineVersion>(Environment.GetEnvironmentVariable("KD_VER") ?? "VER_UE5_6"), usmap, CustomSerializationFlags.None);
 
 /// <summary>反编译单个资产 → 文件级伪代码（资产头 + 函数索引 + 全部函数）。</summary>
 (string Text, string SigText, int FuncCount, int InlinedCount)
