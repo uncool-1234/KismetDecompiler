@@ -175,8 +175,17 @@ public static class SemanticOptimizer
                 }
                 if (!betweenOk) continue;
 
+                // [fix] 单次使用要在整个函数范围内成立。seq 只含同层叶子语句，嵌套块（if 体、循环体）里的
+                // 使用不在其中：DownloadImage_ReturnValue 被内联进 IsValid(...) 之后，if 体里的
+                // .OnSuccess.Add(...) 就悬空了。
+                if (UsesAfterDefInScope(block, seq[info.nodeIdx], temp) != 1) continue;
+
                 if (!TryInlineIntoLine(seq[useIdx].Text, temp, info.rhs, out var newLine)) continue;
                 lines[seq[useIdx].LineIndex] = newLine; // 行直改（无渲染往返）
+                // [fix] 同一行里有多个单次使用的临时量时，第二个必须在第一个的结果上继续替换。
+                // 原实现每次都从解析时的快照 seq[useIdx].Text 重新构造，后写的覆盖先写的，
+                // 但先写的那个定义行已经被清空 → 悬空引用（ApplyDataFrame / BuildSendURL / ValidateConfig）。
+                seq[useIdx].Text = newLine;
                 lines[info.defLine] = "";                // 标记删除
                 changed = true;
             }
@@ -242,6 +251,33 @@ public static class SemanticOptimizer
             lines.RemoveAt(idx);
 
         return changed;
+    }
+
+    /// <summary>
+    /// 从 def 节点之后的所有同层兄弟（含它们的嵌套 { } 子树）里数 temp 的使用次数，属性访问 temp.Member 也算。
+    /// 只看 def 所在容器的后续范围，所以同名临时量在别的块里再次定义/使用（两个 for 循环共用
+    /// Subtract_IntInt_ReturnValue）不会互相阻断。
+    /// </summary>
+    private static int UsesAfterDefInScope(StmtNode container, StmtNode defNode, string temp)
+    {
+        var rx = new Regex($@"(?<![\w.]){Regex.Escape(temp)}(?!\w)");
+        var start = container.Children.IndexOf(defNode);
+        if (start < 0) return int.MaxValue;
+        var total = 0;
+        void Walk(StmtNode n)
+        {
+            if (n.LineIndex >= 0 && !n.Text.TrimStart().StartsWith("//")) total += rx.Matches(n.Text).Count;
+            foreach (var c in n.Children) Walk(c);
+        }
+        for (var k = start + 1; k < container.Children.Count; k++)
+        {
+            // 同名临时量在后面被重新赋值 → 之后的使用属于新的定义，不再数
+            var c = container.Children[k];
+            var m = AssignRegex.Match(c.Text);
+            if (m.Success && m.Groups["lhs"].Value == temp) break;
+            Walk(c);
+        }
+        return total;
     }
 
     private static bool TryInlineIntoLine(string line, string temp, string rhs, out string newLine)

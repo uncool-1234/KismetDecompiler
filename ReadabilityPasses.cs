@@ -338,7 +338,9 @@ public static class ReadabilityPasses
             k++;
         }
         if (dropped == 0) return null;
-        return (k - 1, new List<string>());
+        // [fix] 被替换的区间是 [i, k-1]，含终结语句本身。原实现返回空列表，把 return;/break;/goto 也一起删了，
+        // 反 Dispatch 的每个 case 体因此丢掉收尾，读起来像 C 的 fallthrough。
+        return (k - 1, new List<string> { lines[i] });
     }
 
     /// <summary>
@@ -583,7 +585,54 @@ public static class ReadabilityPasses
         if (lines[i].Trim() != "continue;") return null;
         var k = NextNonEmpty(lines, i + 1);
         if (k < 0 || lines[k].Trim() != "}") return null;
+        // [fix] 只有当这个 } 一路外推都落在「循环体的最后位置」时 continue 才是多余的。
+        // 原实现只看下一行是 }，会把 if 分支里的 continue 也删掉，分支随即穿透到后面的语句。
+        if (!IsLoopBodyTail(lines, k)) return null;
         return (i, new List<string>());
+    }
+
+    private static int OpenBraceOf(List<string> lines, int close)
+    {
+        var depth = 0;
+        for (var j = close; j >= 0; j--)
+        {
+            var t = lines[j].Trim();
+            if (t == "}") depth++;
+            else if (t == "{" && --depth == 0) return j;
+        }
+        return -1;
+    }
+
+    private static bool IsLoopBodyTail(List<string> lines, int close)
+    {
+        for (var guard = 0; guard < 64; guard++)
+        {
+            var open = OpenBraceOf(lines, close);
+            if (open < 0) return false;
+            var h = open - 1;
+            while (h >= 0 && lines[h].Trim().Length == 0) h--;
+            if (h < 0) return false;
+            var hdr = lines[h].Trim();
+            if (hdr.StartsWith("while (") || hdr.StartsWith("for (") || hdr == "do") return true;
+            if (!(hdr.StartsWith("if (") || hdr.StartsWith("else"))) return false;
+
+            // 跳过整条 if / else if / else 链，链后面必须没有别的语句，只剩外层的 }
+            var ind = Indent(lines[h]);
+            var end = close;
+            while (true)
+            {
+                var j = NextNonEmpty(lines, end + 1);
+                if (j < 0 || !lines[j].Trim().StartsWith("else") || Indent(lines[j]) != ind) break;
+                if (!BlockBraceAt(lines, j, out var eb)) return false;
+                var ec = MatchBrace(lines, eb);
+                if (ec < 0) return false;
+                end = ec;
+            }
+            var k = NextNonEmpty(lines, end + 1);
+            if (k < 0 || lines[k].Trim() != "}") return false;
+            close = k;
+        }
+        return false;
     }
 
     /// <summary><c>while (true) { if (!C) break; BODY }</c> → <c>while (C) { BODY }</c>。</summary>
@@ -857,12 +906,19 @@ public static class ReadabilityPasses
         var depth = 0;
         var opAt = -1;
         var opLen = 0;
+        var inStr = false;
         for (var i = 0; i < inner.Length; i++)
         {
             var c = inner[i];
+            if (c == '"' && (i == 0 || inner[i - 1] != '\\')) { inStr = !inStr; continue; }
+            if (inStr) continue;
             if (c is '(' or '[') { depth++; continue; }
             if (c is ')' or ']') { depth--; continue; }
             if (depth != 0) continue;
+            // [fix] 最外层有 && / || / ?: 时，!(A || B != C) 不能只翻转其中一个比较（会丢掉 ! 并保留 ||，
+            // 违反德摩根）。宁可保留 !(...)。
+            if ((c == '&' || c == '|') && i + 1 < inner.Length && inner[i + 1] == c) return false;
+            if (c == '?') return false;
             if (i + 1 < inner.Length && (inner[i + 1] == '=' || inner[i + 1] == c) && (c is '<' or '>' or '=' or '!'))
             {
                 if (opAt >= 0) return false;                  // 多个比较 → 不猜

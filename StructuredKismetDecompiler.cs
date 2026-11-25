@@ -92,6 +92,8 @@ public class StructuredKismetDecompiler
     private readonly List<Loop> _loops = new();
     private readonly Dictionary<int, int> _innermostLoop = new();   // 块 → 最内层循环头
     private readonly HashSet<int> _emittedLoops = new();
+    /// <summary>[fix] 反 Dispatch 的 case 入口块。跳到另一个事件的入口必须是 goto，不能当成汇合点静默结束。</summary>
+    private HashSet<int> _dispatchEntries = new();
     private readonly List<LoopCtx> _loopStack = new();
 
     private readonly List<string> _out = new();
@@ -240,7 +242,11 @@ public class StructuredKismetDecompiler
             return Assemble();
         }
 
-        ComputeDominators();
+        var domRoots = new List<int>();
+        foreach (var (n0, _) in calls)
+            if (_idxOfOff.TryGetValue(n0, out var si0) && si0 < _blockOfStmt.Length && _blockOfStmt[si0] >= 0)
+                domRoots.Add(_blockOfStmt[si0]);
+        ComputeDominators(domRoots);
         ComputePostDominators();
         FindLoops();
 
@@ -253,6 +259,7 @@ public class StructuredKismetDecompiler
                 if (bid >= 0 && _blocks[bid].Reachable) caseEntries.Add((bid, n, caller));
             }
         caseEntries = caseEntries.OrderBy(c => c.N).ToList();
+        _dispatchEntries = new HashSet<int>(caseEntries.Select(c => c.Block));
 
         _ind = 0;
         EmitLine($"{retType} {_funcName}({sig.ParamList()})");
@@ -573,12 +580,30 @@ public class StructuredKismetDecompiler
 
     // ================= 4. 支配 / 后支配 =================
 
-    private void ComputeDominators()
+    private void ComputeDominators(IReadOnlyCollection<int>? extraRoots = null)
     {
         var n = _blocks.Count;
-        var preds = new IReadOnlyList<int>[n];
-        for (var i = 0; i < n; i++) preds[i] = _blocks[i].Pred;
-        _dom = ComputeDomSets(n, preds, 0);
+        if (extraRoots is null || extraRoots.Count == 0)
+        {
+            var preds0 = new IReadOnlyList<int>[n];
+            for (var i = 0; i < n; i++) preds0[i] = _blocks[i].Pred;
+            _dom = ComputeDomSets(n, preds0, 0);
+            return;
+        }
+        // [fix] ubergraph：块 0 只是 ComputedJump（无后继），case 入口没有前驱。
+        // 单入口算法会让每个入口保持「被所有块支配」的初值，下游整段都被当成回边，凭空长出 while(true)。
+        // 接一个虚拟根，让所有 case 入口（和块 0）都由它支配。
+        var total = n + 1;
+        var preds = new IReadOnlyList<int>[total];
+        var roots = new HashSet<int>(extraRoots) { 0 };
+        for (var i = 0; i < n; i++)
+        {
+            var l = new List<int>(_blocks[i].Pred);
+            if (roots.Contains(i)) l.Add(n);
+            preds[i] = l;
+        }
+        preds[n] = new List<int>();
+        _dom = ComputeDomSets(total, preds, n);
     }
 
     private void ComputePostDominators()
@@ -720,7 +745,7 @@ public class StructuredKismetDecompiler
     /// <summary>这条分支是不是「什么都没发射、直接离开本层循环」——那样必须写成 break。</summary>
     private bool LeavesLoopEmittingNothing(int blk, LoopCtx loop, HashSet<int> stops, int follow)
         => blk == follow
-           || loop.Exits.Contains(blk)          // 边缘块：区域到它就停，else 会空掉
+           || (loop.Exits.Contains(blk) && !HasRealStatements(_blocks[blk]))   // [fix] 带语句的出口块不能当空壳丢掉
            || EmptyTrampolineTo(blk, follow, stops);
 
     /// <summary>从 blk 出发只经过「没有语句、只做无条件跳转」的块，最终是否落到 target。</summary>
@@ -733,11 +758,31 @@ public class StructuredKismetDecompiler
             if (cur == target) return true;
             var b = _blocks[cur];
             // 只有「没有语句 + 无条件跳转」的块才能被安全跳过；其余一律认为这条路会留下代码
-            if (b.Emitted || b.Start != b.End || b.Term != Term.Jump) return false;
+            if (b.Emitted || HasRealStatements(b) || b.Term != Term.Jump) return false;   // [fix] 原 Start != End 恒真
             if (cur != blk && stops.Contains(cur)) return false;
             cur = b.JumpSucc;
         }
         return false;
+    }
+
+    /// <summary>[fix] 块里是否有真实语句。区间 [Start,End) 含终结指令，所以不能用 Start != End 判空。</summary>
+    private bool HasRealStatements(Block b)
+    {
+        for (var i = b.Start; i < b.End; i++)
+            if (_stmts[i].Expr is not (EX_Jump or EX_JumpIfNot or EX_Return or EX_EndOfScript
+                or EX_PushExecutionFlow or EX_PopExecutionFlow or EX_PopExecutionFlowIfNot))
+                return true;
+        return false;
+    }
+
+    private bool IsPureReturn(int id)
+        => id >= 0 && id < _blocks.Count && _blocks[id].Term == Term.Return && !HasRealStatements(_blocks[id]);
+
+    private static HashSet<int> Without(HashSet<int> set, int remove)
+    {
+        var copy = new HashSet<int>(set);
+        copy.Remove(remove);
+        return copy;
     }
 
     private Loop LoopOfHeader(int header) => _loops.First(l => l.Header == header);
@@ -763,9 +808,24 @@ public class StructuredKismetDecompiler
     {
         while (id >= 0 && id < _blocks.Count)
         {
-            if (stops.Contains(id)) return;
+            if (stops.Contains(id))
+            {
+                if (_dispatchEntries.Contains(id) && id != follow) EmitGoto(id, follow);   // [fix] 条件边指向别的 case 入口
+                return;
+            }
+            // [fix] 汇合点是当前循环的 Follow（且不在循环体内）：走到这里说明各分支都已写成 break/continue，
+            // 后面没有活路径。原实现会把 Follow（常是函数末尾的 return）发射到循环体里面。
+            if (_loopStack.Count > 0 && _loopStack[^1].Follow == id && !_loopStack[^1].Blocks.Contains(id)) return;
             var b = _blocks[id];
-            if (b.Emitted) return;
+            if (b.Emitted)
+            {
+                // [fix] 已发射的块又被一条条件边/落空边指到。原实现在这里静默 return，
+                // 会让这条路径整段丢掉共享尾部（else 变空、ReturnValue 赋值消失）。
+                if (IsPureReturn(id)) EmitLine(ReturnText(b), id);
+                else if (_loopStack.Count > 0 && _loopStack[^1].Header == id) EmitLine("continue;");
+                else EmitGoto(id, follow);
+                return;
+            }
 
             if (_innermostLoop.TryGetValue(id, out var h) && h == id && !_emittedLoops.Contains(id))
             {
@@ -791,7 +851,12 @@ public class StructuredKismetDecompiler
                     if (act == JumpAction.Stop) return;
                     if (act == JumpAction.Break) { EmitLine("break;"); return; }
                     if (act == JumpAction.Continue) { EmitLine("continue;"); return; }
-                    if (act == JumpAction.Goto) { EmitGoto(b.JumpSucc, follow); return; }
+                    if (act == JumpAction.Goto)
+                    {
+                        if (IsPureReturn(b.JumpSucc)) EmitLine(ReturnText(_blocks[b.JumpSucc]), b.JumpSucc);
+                        else EmitGoto(b.JumpSucc, follow);
+                        return;
+                    }
                     id = b.JumpSucc;
                     continue;
                 }
@@ -799,16 +864,30 @@ public class StructuredKismetDecompiler
                     id = EmitIf(b, stops, follow);
                     continue;
                 default:
+                {
                     if (b.FallSucc < 0) return;
+                    var fa = ResolveTarget(b.FallSucc, stops);
+                    if (fa == JumpAction.Stop) return;
+                    if (fa == JumpAction.Break) { EmitLine("break;"); return; }
+                    if (fa == JumpAction.Continue) { EmitLine("continue;"); return; }
+                    if (fa == JumpAction.Goto)
+                    {
+                        if (IsPureReturn(b.FallSucc)) EmitLine(ReturnText(_blocks[b.FallSucc]), b.FallSucc);
+                        else EmitGoto(b.FallSucc, follow);
+                        return;
+                    }
                     id = b.FallSucc;
                     continue;
+                }
             }
         }
     }
 
-    private JumpAction ResolveJump(Block b, HashSet<int> stops)
+    private JumpAction ResolveJump(Block b, HashSet<int> stops) => ResolveTarget(b.JumpSucc, stops);
+
+    /// <summary>[fix] 与 Jump 共用：落空边（FallSucc）同样可能是 break / continue / 已发射块，不能只靠循环顶部的静默检查。</summary>
+    private JumpAction ResolveTarget(int t, HashSet<int> stops)
     {
-        var t = b.JumpSucc;
         if (t < 0) return JumpAction.Stop;
 
         // 回到（最内层）循环头 → continue
@@ -819,7 +898,9 @@ public class StructuredKismetDecompiler
             var inner = _loopStack[^1];
             if (!inner.Blocks.Contains(t) && inner.Follow == t) return JumpAction.Break;
         }
-        if (stops.Contains(t)) return JumpAction.Stop;
+        // [fix] stops 里混着「其他 case 入口」：跳过去不是落到汇合点，是进入另一个事件的代码，
+        // 原实现一律 Stop → case 体静默变空（OnAddonsRemoved 只是 Jump 到 OnAddonsAdded 的入口）。
+        if (stops.Contains(t)) return _dispatchEntries.Contains(t) ? JumpAction.Goto : JumpAction.Stop;
         if (!_blocks[t].Emitted) return JumpAction.Follow;
         // 目标已发射过（非常规回边）→ 用 label + goto 保真
         return JumpAction.Goto;
@@ -850,7 +931,7 @@ public class StructuredKismetDecompiler
             var inner = _loopStack[^1];
             if (f == t && inner.Follow == t && !inner.Blocks.Contains(t))
             {
-                EmitLine($"if (!{cond}) break;");
+                EmitLine($"if (!{Paren(cond)}) break;");
                 EmitRegion(n, With(stops, t), t);
                 return t;
             }
@@ -861,13 +942,27 @@ public class StructuredKismetDecompiler
             {
                 if (LeavesLoopEmittingNothing(t, inner, stops, f))
                 {
-                    EmitLine($"if (!{cond}) break;");
+                    EmitLine($"if (!{Paren(cond)}) break;");
                     EmitRegion(n, With(stops, t), t);
                     return t;
                 }
                 if (LeavesLoopEmittingNothing(n, inner, stops, f))
                 {
                     EmitLine($"if ({cond}) break;");
+                    EmitRegion(t, With(stops, n), n);
+                    return n;
+                }
+                // [fix] 出口块带语句（如 ReturnValue = true）：原实现把它当成空壳 break 掉，
+                // 之后再也没人发射它。就地写成 { 语句; break; }（块尾的 Jump→汇合点会被解析成 break）。
+                if (inner.Exits.Contains(t) && t != f && !_blocks[t].Emitted)
+                {
+                    EmitIfBlock("!" + Paren(cond), () => EmitRegion(t, Without(stops, t), f));
+                    EmitRegion(n, With(stops, t), t);
+                    return t;
+                }
+                if (inner.Exits.Contains(n) && n != f && !_blocks[n].Emitted)
+                {
+                    EmitIfBlock(cond, () => EmitRegion(n, Without(stops, n), f));
                     EmitRegion(t, With(stops, n), n);
                     return n;
                 }
@@ -1153,7 +1248,9 @@ public class StructuredKismetDecompiler
             dupPlan[outToFinal[gotoOut]] = (outToFinal[tStart], outToFinal[tEnd - 1] + 1, gInd - tInd);
         }
 
-        var text = ReadabilityPasses.Run(string.Join("\n", final), dupPlan);
+        var text = Environment.GetEnvironmentVariable("KD_RAW") == "1"          // [debug] 跳过文本改写，直接看结构化发射
+            ? string.Join("\n", final)
+            : ReadabilityPasses.Run(string.Join("\n", final), dupPlan);
 
         // 可读性改写可能又消掉了一批临时量（如前导赋值折进循环条件），最后再过滤一次声明。
         if (_declInsertAt >= 0 && _locals.Count > 0 && _declInsertAt <= text.Length)
@@ -1216,7 +1313,24 @@ public class StructuredKismetDecompiler
         return false;
     }
 
-    private static string Paren(string s) => s.StartsWith('(') && s.EndsWith(')') ? s : "(" + s + ")";
+    private static string Paren(string s)
+    {
+        // [fix] "(a) && (b)" 以 ( 开头、以 ) 结尾，但首个 ( 并不包住整个表达式
+        if (s.Length > 1 && s[0] == '(' && s[^1] == ')')
+        {
+            var depth = 0; var inStr = false; var wrapsAll = true;
+            for (var i = 0; i < s.Length; i++)
+            {
+                var c = s[i];
+                if (c == '"' && (i == 0 || s[i - 1] != '\\')) inStr = !inStr;
+                if (inStr) continue;
+                if (c == '(') depth++;
+                else if (c == ')' && --depth == 0 && i < s.Length - 1) { wrapsAll = false; break; }
+            }
+            if (wrapsAll) return s;
+        }
+        return "(" + s + ")";
+    }
 
     // ================= 位集工具 =================
 
